@@ -199,7 +199,7 @@ class BFPDecoder:
             FS₀ = max(I²) = max(Q²) = max(I²+Q²)
                 = (max_mantissa × max_scale)²
                 = (2^8 × 2^15)² = 2^46
-            REF = FS₀ · 2^(-FS_Offset) = 2^(46 - fs_offset)
+            REF = FS₀ · 2^(-2·FS_Offset) = 2^(46 - 2·fs_offset)
         """
         iq = iq_complex.astype(np.complex128)
         power_per_sc = iq.real ** 2 + iq.imag ** 2
@@ -210,7 +210,7 @@ class BFPDecoder:
             return -np.inf
 
         power = np.mean(active)
-        ref   = REF_POWER_BASE * (2.0 ** (-fs_offset))   # 2^(46 - fs_offset)  per O-RAN spec
+        ref   = REF_POWER_BASE * (2.0 ** (-2 * fs_offset))   # 2^(46 - 2*fs_offset)  per O-RAN spec
         return 10.0 * np.log10(power / ref)
 
 
