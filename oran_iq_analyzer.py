@@ -54,9 +54,12 @@ ECPRI_MSG_IQ_DATA = 0x00   # eCPRI message type: IQ Data
 IQ_WIDTH         = 9    # bits per I or Q sample
 NUM_SUBC_PER_PRB = 12   # subcarriers per PRB
 
-# 0 dBFS reference: max mantissa value for 9-bit signed = 255
-MAX_MANTISSA    = (1 << (IQ_WIDTH - 1)) - 1   # 255
-REF_POWER_0DBFS = 2.0 * (MAX_MANTISSA ** 2)   # I_max^2 + Q_max^2 = 130050
+# 0dBFS reference base (fs_offset=0):
+#   max_value = 2^(IQ_WIDTH-1) * 2^MAX_EXPONENT = 2^8 * 2^15 = 2^23
+#   REF_BASE  = max_value^2 = 2^46  (per component; I²+Q² at full scale = 2*2^46)
+#   With fs_offset: REF = 2^(46 - 2*fs_offset)
+IQ_MAX_EXPONENT = 15
+REF_POWER_BASE  = 2.0 ** 46   # = (2^8 * 2^15)^2
 
 # NR RB count table: (bandwidth_MHz, scs_khz) -> num_RBs
 # Source: 3GPP TS 38.101-1, Table 5.3.2-1
@@ -185,13 +188,30 @@ class BFPDecoder:
         return iq_complex, raw_i, raw_q, exponent
 
     @staticmethod
-    def calc_power_dbfs(raw_i: np.ndarray, raw_q: np.ndarray) -> float:
-        """Average power in dBFS (exponent-independent)."""
-        power = (raw_i.astype(np.float64) ** 2 +
-                 raw_q.astype(np.float64) ** 2).mean()
-        if power <= 0:
+    def calc_power_dbfs(iq_complex: np.ndarray, fs_offset: int = 0) -> float:
+        """
+        Average power per active subcarrier in dBFS.
+
+        Only active subcarriers (|I|>0 or |Q|>0) are counted.
+        Zero-valued subcarriers (guard bands, unused RBs) are excluded.
+
+        0dBFS definition (O-RAN spec):
+            FS₀ = max(I²) = max(Q²) = max(I²+Q²)
+                = (max_mantissa × max_scale)²
+                = (2^8 × 2^15)² = 2^46
+            REF = FS₀ · 2^(-FS_Offset) = 2^(46 - fs_offset)
+        """
+        iq = iq_complex.astype(np.complex128)
+        power_per_sc = iq.real ** 2 + iq.imag ** 2
+
+        # Exclude zero subcarriers (guard bands / unused allocations)
+        active = power_per_sc[power_per_sc > 0]
+        if len(active) == 0:
             return -np.inf
-        return 10.0 * np.log10(power / REF_POWER_0DBFS)
+
+        power = np.mean(active)
+        ref   = REF_POWER_BASE * (2.0 ** (-fs_offset))   # 2^(46 - fs_offset)  per O-RAN spec
+        return 10.0 * np.log10(power / ref)
 
 
 # ============================================================
@@ -334,7 +354,8 @@ class AnalysisResult:
 # ============================================================
 def process_pcap(filepath, frame_start, frame_end, parser,
                  progress_cb=None, cancel_flag=None,
-                 debug_mode=False, debug_max=DEBUG_MAX_PACKETS) -> AnalysisResult:
+                 debug_mode=False, debug_max=DEBUG_MAX_PACKETS,
+                 fs_offset=0) -> AnalysisResult:
 
     result      = AnalysisResult()
     frame_num   = 0
@@ -418,21 +439,17 @@ def process_pcap(filepath, frame_start, frame_end, parser,
             key    = (pkt.data_direction, pkt.eaxc_id.ru_port_id)
             bucket = result.data[key]
 
-            all_ri, all_rq, all_iq = [], [], []
+            all_iq = []
             for sec in pkt.sections:
                 for (iq, ri, rq, _) in sec.prb_data:
-                    all_ri.append(ri)
-                    all_rq.append(rq)
                     all_iq.append(iq)
 
-            if not all_ri:
+            if not all_iq:
                 continue
 
-            ri_flat = np.concatenate(all_ri)
-            rq_flat = np.concatenate(all_rq)
             iq_flat = np.concatenate(all_iq)
 
-            dbfs = BFPDecoder.calc_power_dbfs(ri_flat, rq_flat)
+            dbfs = BFPDecoder.calc_power_dbfs(iq_flat, fs_offset=fs_offset)
             bucket['power_dbfs'].append((
                 pkt.frame_id, pkt.subframe_id, pkt.slot_id,
                 pkt.start_symbol_id, dbfs))
@@ -475,7 +492,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("O-RAN CU-Plane IQ Analyzer")
+        self.title("O-RAN CU-Plane IQ Analyzer  v1.2")
         self.geometry("1250x860")
         self.minsize(950, 680)
         self.configure(bg="#2b2b2b")
@@ -488,6 +505,7 @@ class App(tk.Tk):
         self.ru_port_str      = tk.StringVar(value="0")  # free text
         self.bandwidth_mhz    = tk.IntVar(value=20)
         self.scs_khz          = tk.IntVar(value=30)
+        self.fs_offset        = tk.IntVar(value=0)   # O-RAN fs-offset 0-16
         self.eaxc_mode        = tk.StringVar(value="standard")
         self.section_hdr_size = tk.IntVar(value=4)
         self.debug_mode       = tk.BooleanVar(value=False)
@@ -615,6 +633,14 @@ class App(tk.Tk):
         ttk.Combobox(row3, textvariable=self.scs_khz,
                      values=SUPPORTED_SCS, width=7,
                      state="readonly").grid(row=1, column=1, sticky="w")
+        tk.Label(row3, text="fs-offset:", bg="#3c3f41", fg="#a9b7c6",
+                 width=10, anchor="w").grid(row=2, column=0, sticky="w", pady=2)
+        tk.Spinbox(row3, from_=0, to=16, textvariable=self.fs_offset,
+                   width=4, bg="#4c5052",
+                   fg="white").grid(row=2, column=1, sticky="w")
+        tk.Label(row3, text="0dBFS ref = 2^(46-2×fs-offset)",
+                 bg="#3c3f41", fg="#6A9955",
+                 font=("Consolas", 7)).grid(row=3, column=0, columnspan=2, sticky="w")
 
         # --- Advanced ---
         adv  = self._lf(parent, "Advanced (Parser)")
@@ -868,6 +894,7 @@ class App(tk.Tk):
         dir_bit = self.dir_bit.get()
         debug   = self.debug_mode.get()
         dbg_max = self.debug_max_var.get()
+        fso     = self.fs_offset.get()
 
         def worker():
             try:
@@ -877,6 +904,7 @@ class App(tk.Tk):
                     cancel_flag=self._cancel_flag,
                     debug_mode=debug,
                     debug_max=dbg_max,
+                    fs_offset=fso,
                 )
                 self.result = res
                 self.after(0, lambda: self._on_done(dir_bit, ru_port, bw, scs))
@@ -927,8 +955,10 @@ class App(tk.Tk):
             self._populate_debug()
             return
 
-        dbfs_values = np.array([p[4] for p in power_list])
-        avg_dbfs    = float(np.nanmean(dbfs_values))
+        dbfs_values  = np.array([p[4] for p in power_list])
+        finite_dbfs  = dbfs_values[np.isfinite(dbfs_values)]
+        avg_dbfs     = float(np.mean(finite_dbfs)) if len(finite_dbfs) > 0 else -np.inf
+        zero_pkt_cnt = int(np.sum(~np.isfinite(dbfs_values)))
 
         total_prbs  = (sum(len(iq) for iq in iq_list[-1:]) // NUM_SUBC_PER_PRB
                        if iq_list else 0)
@@ -946,7 +976,7 @@ class App(tk.Tk):
         self.stats_var.set(
             f"dirBit={dir_bit} | RU_Port={ru_port}\n"
             f"BW={bw} MHz | SCS={scs} kHz | RBs={num_rb}\n"
-            f"Matched pkts: {len(power_list):,}\n"
+            f"Matched pkts: {len(power_list):,}  (zero-SC: {zero_pkt_cnt})\n"
             f"Total eCPRI: {self.result.packet_count:,} | Err: {self.result.error_count}"
         )
         self.status_var.set("Done.")
