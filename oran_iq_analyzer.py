@@ -183,9 +183,12 @@ class BFPDecoder:
             raw_i[k] = i_val
             raw_q[k] = q_val
 
+        # Scale for power calculation (absolute amplitude)
         scale      = float(1 << exponent)
         iq_complex = (raw_i * scale + 1j * raw_q * scale).astype(np.complex64)
-        return iq_complex, raw_i, raw_q, exponent
+        # Also store mantissa-only (unscaled) IQ for constellation display
+        iq_mantissa = (raw_i + 1j * raw_q).astype(np.complex64)
+        return iq_complex, raw_i, raw_q, exponent, iq_mantissa
 
     @staticmethod
     def calc_power_dbfs(iq_complex: np.ndarray, fs_offset: int = 0) -> float:
@@ -228,7 +231,7 @@ class SectionType1:
         self.num_symbol  = 0
         self.ef          = 0
         self.beam_id     = 0
-        self.prb_data    = []   # list of (iq_complex, raw_i, raw_q, exponent)
+        self.prb_data    = []   # list of (iq_complex, raw_i, raw_q, exponent, iq_mantissa)
 
 
 def _parse_section_header(data: bytes, offset: int, header_size: int = 4):
@@ -317,10 +320,10 @@ class ORANParser:
                 if offset + prb_sz > len(payload):
                     break
                 try:
-                    iq, ri, rq, exp = BFPDecoder.decode_prb(
+                    iq, ri, rq, exp, iq_m = BFPDecoder.decode_prb(
                         payload[offset: offset + prb_sz],
                         udcomp_present=self.udcomp_present)
-                    sec.prb_data.append((iq, ri, rq, exp))
+                    sec.prb_data.append((iq, ri, rq, exp, iq_m))
                 except Exception:
                     pass
                 offset += prb_sz
@@ -342,7 +345,8 @@ class AnalysisResult:
     def __init__(self):
         self.data = defaultdict(lambda: {
             'power_dbfs': [],   # (frame, subframe, slot, symbol, dbfs)
-            'iq_complex': [],   # list of np.ndarray complex64
+            'iq_complex': [],   # list of np.ndarray complex64 (legacy)
+            'iq_by_exp':  defaultdict(list),  # exp -> list of np.ndarray complex64
         })
         self.packet_count = 0
         self.error_count  = 0
@@ -407,14 +411,14 @@ def process_pcap(filepath, frame_start, frame_end, parser,
             if debug_mode and debug_count < debug_max:
                 n_prbs   = sum(len(s.prb_data) for s in pkt.sections)
                 exp_list = [exp for s in pkt.sections
-                            for (_, _, _, exp) in s.prb_data]
+                            for (_, _, _, exp, _m) in s.prb_data]
                 exp_str  = (f"exp=[{min(exp_list)}~{max(exp_list)}]"
                             if exp_list else "exp=[]")
 
                 # All PRBs: all 12 subcarrier IQ pairs
                 iq_sample_str = ""
                 for sec_idx, sec in enumerate(pkt.sections):
-                    for prb_idx, (_, ri, rq, exp) in enumerate(sec.prb_data):
+                    for prb_idx, (_, ri, rq, exp, _m) in enumerate(sec.prb_data):
                         pairs = "  ".join(
                             f"SC{k}:(I={ri[k]:5d},Q={rq[k]:5d})"
                             for k in range(len(ri))
@@ -439,10 +443,14 @@ def process_pcap(filepath, frame_start, frame_end, parser,
             key    = (pkt.data_direction, pkt.eaxc_id.ru_port_id)
             bucket = result.data[key]
 
-            all_iq = []
+            all_iq = []   # scaled, for dBFS power
+            # Group mantissa IQ by exponent value for per-exp constellation display
+            iq_per_exp = defaultdict(list)
+
             for sec in pkt.sections:
-                for (iq, ri, rq, _) in sec.prb_data:
+                for (iq, ri, rq, exp, iq_m) in sec.prb_data:
                     all_iq.append(iq)
+                    iq_per_exp[exp].append(iq_m)
 
             if not all_iq:
                 continue
@@ -453,7 +461,9 @@ def process_pcap(filepath, frame_start, frame_end, parser,
             bucket['power_dbfs'].append((
                 pkt.frame_id, pkt.subframe_id, pkt.slot_id,
                 pkt.start_symbol_id, dbfs))
-            bucket['iq_complex'].append(iq_flat)
+            # Append per-exp IQ arrays
+            for exp, arrays in iq_per_exp.items():
+                bucket['iq_by_exp'][exp].append(np.concatenate(arrays))
 
     return result
 
@@ -973,11 +983,16 @@ class App(tk.Tk):
             text=(f"Full-RB: {total_prbs} / {num_rb} RBs  "
                   f"({'✓ OK' if full_rb_ok else '✗ Mismatch'})"))
 
+        exp_dist = {exp: len(arrays)
+                    for exp, arrays in sorted(bucket['iq_by_exp'].items())}
+        exp_str  = "  ".join(f"exp{e}:{n}pkts" for e, n in exp_dist.items())
+
         self.stats_var.set(
             f"dirBit={dir_bit} | RU_Port={ru_port}\n"
             f"BW={bw} MHz | SCS={scs} kHz | RBs={num_rb}\n"
             f"Matched pkts: {len(power_list):,}  (zero-SC: {zero_pkt_cnt})\n"
-            f"Total eCPRI: {self.result.packet_count:,} | Err: {self.result.error_count}"
+            f"Total eCPRI: {self.result.packet_count:,} | Err: {self.result.error_count}\n"
+            f"exp dist: {exp_str}"
         )
         self.status_var.set("Done.")
 
@@ -989,7 +1004,7 @@ class App(tk.Tk):
         # ---- Plot constellation ----
         self.notebook.select(self.tab_const)
         self.update_idletasks()
-        self._plot_constellation(iq_list, dir_bit, ru_port)
+        self._plot_constellation(bucket['iq_by_exp'], dir_bit, ru_port)
 
         # ---- Populate debug log and switch tab if needed ----
         self._populate_debug()
@@ -1040,25 +1055,57 @@ class App(tk.Tk):
             pass
         self.canvas_power.draw_idle()
 
-    def _plot_constellation(self, iq_list, dir_bit, ru_port):
-        ax = self.ax_const
-        ax.cla()
-        self._style_ax(ax, "I", "Q",
-                       f"Constellation  [dirBit={dir_bit} | RU_Port={ru_port}]")
+    def _plot_constellation(self, iq_by_exp, dir_bit, ru_port):
+        # Color palette per exp value
+        EXP_COLORS = [
+            "#61AFEF", "#98C379", "#E5C07B", "#E06C75",
+            "#C678DD", "#56B6C2", "#ABB2BF", "#D19A66",
+        ]
 
-        all_iq = np.concatenate(iq_list) if iq_list else np.array([], dtype=np.complex64)
-        if len(all_iq) > 50000:
-            idx    = np.random.choice(len(all_iq), 50000, replace=False)
-            all_iq = all_iq[idx]
+        sorted_exps = [e for e in sorted(iq_by_exp.keys()) if e > 0]  # skip exp=0 (null/DMRS)
+        n = len(sorted_exps)
 
-        if len(all_iq) > 0:
-            ax.scatter(all_iq.real, all_iq.imag, s=1, color="#61AFEF", alpha=0.3)
-            ax.axhline(0, color="#555", lw=0.5)
-            ax.axvline(0, color="#555", lw=0.5)
-            ax.set_aspect("equal", adjustable="box")
+        # Rebuild figure with n subplots side-by-side
+        self.fig_const.clf()
+        if n == 0:
+            self.ax_const = self.fig_const.add_subplot(111)
+            self._style_ax(self.ax_const, "I", "Q", "Constellation — no data")
+            self.canvas_const.draw_idle()
+            return
 
+        axes = self.fig_const.subplots(1, n, squeeze=False)[0]
+        self.ax_const = axes[0]   # keep reference for save/export
+
+        for col, exp in enumerate(sorted_exps):
+            ax    = axes[col]
+            color = EXP_COLORS[col % len(EXP_COLORS)]
+            arrays = iq_by_exp[exp]
+
+            all_iq = np.concatenate(arrays) if arrays else np.array([], dtype=np.complex64)
+
+            # Remove zero subcarriers (guard / unused)
+            mask   = (all_iq.real != 0) | (all_iq.imag != 0)
+            all_iq = all_iq[mask]
+
+            # Downsample if needed
+            if len(all_iq) > 30000:
+                idx    = np.random.choice(len(all_iq), 30000, replace=False)
+                all_iq = all_iq[idx]
+
+            self._style_ax(ax, "I (mantissa)", "Q" if col == 0 else "",
+                           f"exp={exp}\n({len(arrays)} pkts)")
+            if len(all_iq) > 0:
+                ax.scatter(all_iq.real, all_iq.imag,
+                           s=1, color=color, alpha=0.4)
+                ax.axhline(0, color="#444", lw=0.5)
+                ax.axvline(0, color="#444", lw=0.5)
+                ax.set_aspect("equal", adjustable="box")
+
+        self.fig_const.suptitle(
+            f"Constellation per BFP exponent  [dirBit={dir_bit} | RU_Port={ru_port}]",
+            color="#dcdcdc", fontsize=9, y=1.01)
         try:
-            self.fig_const.tight_layout(pad=1.5)
+            self.fig_const.tight_layout(pad=1.2)
         except Exception:
             pass
         self.canvas_const.draw_idle()
